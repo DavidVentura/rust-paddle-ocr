@@ -156,7 +156,13 @@ fn main() {
     };
 
     // Build our C++ wrapper using cc (always needed)
-    build_wrapper(&manifest_dir_path, &mnn_include_dir, &os, &link_mode);
+    build_wrapper(
+        &manifest_dir_path,
+        &mnn_include_dir,
+        &os,
+        &link_mode,
+        vulkan_enabled,
+    );
 
     // Link libraries
     link_libraries(
@@ -686,6 +692,7 @@ fn build_wrapper(
     mnn_include_dirs: &[PathBuf],
     os: &str,
     link_mode: &MnnLinkMode,
+    vulkan_enabled: bool,
 ) {
     let wrapper_file = manifest_dir.join("cpp/src/mnn_wrapper.cpp");
 
@@ -701,6 +708,44 @@ fn build_wrapper(
 
     for inc in mnn_include_dirs {
         build.include(inc);
+    }
+
+    build.define("OCR_RS_FORCE_VULKAN_LINK", Some("0"));
+
+    if vulkan_enabled {
+        let mnn_root = manifest_dir.join("3rd_party/MNN");
+        let mnn_source_root = mnn_root.join("source");
+        let vulkan_root = mnn_source_root.join("backend/vulkan");
+        let vulkan_include_dirs = [
+            vulkan_root.clone(),
+            vulkan_root.join("component"),
+            vulkan_root.join("runtime"),
+            vulkan_root.join("schema/current"),
+            vulkan_root.join("image/backend"),
+            vulkan_root.join("image/execution"),
+            vulkan_root.join("image/shaders"),
+            vulkan_root.join("image/compiler"),
+            vulkan_root.join("buffer/backend"),
+            vulkan_root.join("buffer/execution"),
+            vulkan_root.join("buffer/shaders"),
+            vulkan_root.join("buffer/compiler"),
+            vulkan_root.join("buffer/render"),
+            vulkan_root.join("buffer/render/compiler"),
+            vulkan_root.join("buffer/render/glsl"),
+            vulkan_root.join("vulkan"),
+        ];
+        let flatbuffers_include_dir = mnn_root.join("3rd_party/flatbuffers/include");
+        if mnn_source_root.exists() {
+            build.include(&mnn_source_root);
+        }
+        for dir in &vulkan_include_dirs {
+            if dir.exists() {
+                build.include(dir);
+            }
+        }
+        if flatbuffers_include_dir.exists() {
+            build.include(&flatbuffers_include_dir);
+        }
     }
 
     // Platform-specific C++ flags
@@ -733,13 +778,16 @@ fn link_libraries(
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
 
-    // Link MNN library based on mode
+    // Link MNN library based on mode. For static/source builds, use whole-archive
+    // so backend runtime creators registered via static initialization are not stripped.
     match link_mode {
         MnnLinkMode::Dynamic => {
             println!("cargo:rustc-link-lib=dylib=MNN");
         }
         MnnLinkMode::Static | MnnLinkMode::BuildFromSource | MnnLinkMode::Prebuilt => {
+            println!("cargo:rustc-link-arg=-Wl,--whole-archive");
             println!("cargo:rustc-link-lib=static=MNN");
+            println!("cargo:rustc-link-arg=-Wl,--no-whole-archive");
         }
     }
 

@@ -11,6 +11,14 @@
 #include <string>
 #include <memory>
 
+#if OCR_RS_FORCE_VULKAN_LINK
+#include "VulkanRuntime.hpp"
+namespace {
+using VulkanCreateFn = MNN::VulkanRuntime *(*)(const MNN::Backend::Info &);
+__attribute__((used)) static VulkanCreateFn g_force_vulkan_runtime_link = &MNN::VulkanRuntime::create;
+}
+#endif
+
 // C++11 compatible make_unique
 template <typename T, typename... Args>
 std::unique_ptr<T> make_unique_ptr(Args &&...args)
@@ -79,35 +87,49 @@ struct MNN_SessionPool
 
 // ============== Helper Functions ==============
 
-static MNN::ScheduleConfig create_schedule_config(const MNNR_Config *config)
+struct MNN_ScheduleBundle
 {
-    MNN::ScheduleConfig schedule;
-    schedule.type = MNN_FORWARD_CPU;
-    schedule.numThread = config ? config->thread_count : 4;
-    if (schedule.numThread <= 0)
+    MNN::BackendConfig backend_config;
+    MNN::ScheduleConfig schedule_config;
+};
+
+static MNNForwardType backend_to_forward_type(const MNNR_Config *config)
+{
+    switch (config ? config->backend : 0)
     {
-        schedule.numThread = 4;
+    case 4:
+        return MNN_FORWARD_VULKAN;
+    case 0:
+    default:
+        return MNN_FORWARD_CPU;
+    }
+}
+
+static MNN_ScheduleBundle create_schedule_config(const MNNR_Config *config)
+{
+    MNN_ScheduleBundle bundle;
+    bundle.schedule_config.type = backend_to_forward_type(config);
+    bundle.schedule_config.numThread = config ? config->thread_count : 4;
+    if (bundle.schedule_config.numThread <= 0)
+    {
+        bundle.schedule_config.numThread = 4;
     }
 
-    MNN::BackendConfig backend;
-    if (config)
+    switch (config ? config->precision_mode : 0)
     {
-        switch (config->precision_mode)
-        {
-        case 1:
-            backend.precision = MNN::BackendConfig::Precision_Low;
-            break;
-        case 2:
-            backend.precision = MNN::BackendConfig::Precision_High;
-            break;
-        default:
-            backend.precision = MNN::BackendConfig::Precision_Normal;
-            break;
-        }
+    case 1:
+        bundle.backend_config.precision = MNN::BackendConfig::Precision_Low;
+        break;
+    case 2:
+        bundle.backend_config.precision = MNN::BackendConfig::Precision_High;
+        break;
+    default:
+        bundle.backend_config.precision = MNN::BackendConfig::Precision_Normal;
+        break;
     }
-    schedule.backendConfig = &backend;
+    bundle.schedule_config.backendConfig = &bundle.backend_config;
 
-    return schedule;
+    return bundle;
 }
 
 static bool init_engine_tensors(MNN_InferenceEngine *engine)
@@ -165,7 +187,7 @@ MNN_SharedRuntime *mnnr_create_runtime(const MNNR_Config *config)
 
     runtime->precision_mode = config ? config->precision_mode : 0;
 
-    runtime->schedule_config.type = MNN_FORWARD_CPU;
+    runtime->schedule_config.type = backend_to_forward_type(config);
     runtime->schedule_config.numThread = runtime->thread_count;
 
     switch (runtime->precision_mode)
@@ -214,8 +236,8 @@ MNN_InferenceEngine *mnnr_create_engine(
     }
 
     // Create default session
-    MNN::ScheduleConfig schedule = create_schedule_config(config);
-    engine->default_session = engine->interpreter->createSession(schedule);
+    auto schedule = create_schedule_config(config);
+    engine->default_session = engine->interpreter->createSession(schedule.schedule_config);
     if (!engine->default_session)
     {
         engine->last_error = "Failed to create default session";
@@ -405,12 +427,12 @@ MNN_SessionPool *mnnr_create_session_pool(
     auto pool = new MNN_SessionPool();
     pool->engine = engine;
 
-    MNN::ScheduleConfig schedule = create_schedule_config(config);
+    auto schedule = create_schedule_config(config);
 
     // Create sessions
     for (size_t i = 0; i < pool_size; i++)
     {
-        MNN::Session *session = engine->interpreter->createSession(schedule);
+        MNN::Session *session = engine->interpreter->createSession(schedule.schedule_config);
         if (!session)
         {
             // Cleanup on failure
@@ -557,8 +579,8 @@ MNN_SingleSession *mnnr_create_session(
     auto session = new MNN_SingleSession();
     session->engine = engine;
 
-    MNN::ScheduleConfig schedule = create_schedule_config(config);
-    session->session = engine->interpreter->createSession(schedule);
+    auto schedule = create_schedule_config(config);
+    session->session = engine->interpreter->createSession(schedule.schedule_config);
 
     if (!session->session)
     {

@@ -39,6 +39,7 @@ extern "C"
     {
         int32_t thread_count;   // Number of threads (0 for auto, -1 to use MNN default thread pool)
         int32_t precision_mode; // 0=Normal, 1=Low(faster), 2=High(accurate)
+        int32_t backend;        // 0=CPU, 4=Vulkan
         bool use_cache;         // Whether to use cache file
         int32_t data_format;    // Input/Output data format
     } MNNR_Config;

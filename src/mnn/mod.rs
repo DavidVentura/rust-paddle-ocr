@@ -178,6 +178,15 @@ mod normal_impl {
             ffi::MNNR_Config {
                 thread_count: self.thread_count,
                 precision_mode: self.precision_mode as i32,
+                backend: match self.backend {
+                    Backend::CPU => 0,
+                    Backend::Metal => 1,
+                    Backend::OpenCL => 2,
+                    Backend::OpenGL => 3,
+                    Backend::Vulkan => 4,
+                    Backend::CUDA => 5,
+                    Backend::CoreML => 6,
+                },
                 use_cache: self.use_cache,
                 data_format: self.data_format as i32,
             }
