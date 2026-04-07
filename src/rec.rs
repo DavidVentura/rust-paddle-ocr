@@ -2,9 +2,11 @@
 //!
 //! Provides text recognition functionality based on PaddleOCR recognition models
 
-use image::DynamicImage;
+use image::{DynamicImage, GenericImageView};
+use log::info;
 use ndarray::ArrayD;
 use std::path::Path;
+use std::time::Instant;
 
 use crate::error::{OcrError, OcrResult};
 use crate::mnn::{InferenceConfig, InferenceEngine};
@@ -268,11 +270,20 @@ impl RecModel {
 
         // Batch processing
         let mut results = Vec::with_capacity(images.len());
+        let batch_total_started = Instant::now();
 
-        for chunk in images.chunks(self.options.batch_size) {
-            let batch_results = self.recognize_batch_internal(chunk)?;
+        for (batch_index, chunk) in images.chunks(self.options.batch_size).enumerate() {
+            let batch_results = self.recognize_batch_internal(chunk, Some(batch_index))?;
             results.extend(batch_results);
         }
+
+        let total_ms = batch_total_started.elapsed().as_secs_f64() * 1000.0;
+        info!(
+            "rec_total images={} batchSize={} totalMs={:.3}",
+            images.len(),
+            self.options.batch_size,
+            total_ms
+        );
 
         Ok(results)
     }
@@ -300,10 +311,10 @@ impl RecModel {
         // Batch processing
         let mut results = Vec::with_capacity(images.len());
 
-        for chunk in images.chunks(self.options.batch_size) {
+        for (batch_index, chunk) in images.chunks(self.options.batch_size).enumerate() {
             // Dereference and convert to Vec<DynamicImage>
             let chunk_owned: Vec<DynamicImage> = chunk.iter().map(|img| (*img).clone()).collect();
-            let batch_results = self.recognize_batch_internal(&chunk_owned)?;
+            let batch_results = self.recognize_batch_internal(&chunk_owned, Some(batch_index))?;
             results.extend(batch_results);
         }
 
@@ -314,6 +325,7 @@ impl RecModel {
     fn recognize_batch_internal(
         &self,
         images: &[DynamicImage],
+        batch_index: Option<usize>,
     ) -> OcrResult<Vec<RecognitionResult>> {
         if images.is_empty() {
             return Ok(Vec::new());
@@ -324,17 +336,34 @@ impl RecModel {
             return Ok(vec![self.recognize(&images[0])?]);
         }
 
+        let total_started = Instant::now();
+        let scaled_widths: Vec<u32> = images
+            .iter()
+            .map(|img| {
+                let (w, h) = img.dimensions();
+                let scale = self.options.target_height as f64 / h as f64;
+                (w as f64 * scale).round() as u32
+            })
+            .collect();
+        let max_scaled_width = scaled_widths.iter().copied().max().unwrap_or(0);
+        let total_scaled_width: u32 = scaled_widths.iter().sum();
+
         // Batch preprocessing
+        let preprocess_started = Instant::now();
         let batch_input = crate::preprocess::preprocess_batch_for_rec(
             images,
             self.options.target_height,
             &self.normalize_params,
         )?;
+        let preprocess_ms = preprocess_started.elapsed().as_secs_f64() * 1000.0;
 
         // Batch inference
+        let inference_started = Instant::now();
         let batch_output = self.engine.run_dynamic(batch_input.view().into_dyn())?;
+        let inference_ms = inference_started.elapsed().as_secs_f64() * 1000.0;
 
         // Decode output for each sample
+        let decode_started = Instant::now();
         let shape = batch_output.shape();
         if shape.len() != 3 {
             return Err(OcrError::PostprocessError(format!(
@@ -353,6 +382,27 @@ impl RecModel {
             let result = self.decode_output(&sample_output_dyn)?;
             results.push(result);
         }
+
+        let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = total_started.elapsed().as_secs_f64() * 1000.0;
+        let batch_shape = batch_input.shape();
+        info!(
+            "rec_batch index={} crops={} targetHeight={} scaledWidths={:?} maxScaledWidth={} totalScaledWidth={} inputTensor=[{}, {}, {}, {}] preprocessMs={:.3} inferMs={:.3} decodeMs={:.3} totalMs={:.3}",
+            batch_index.unwrap_or(0),
+            images.len(),
+            self.options.target_height,
+            scaled_widths,
+            max_scaled_width,
+            total_scaled_width,
+            batch_shape[0],
+            batch_shape[1],
+            batch_shape[2],
+            batch_shape[3],
+            preprocess_ms,
+            inference_ms,
+            decode_ms,
+            total_ms
+        );
 
         Ok(results)
     }
