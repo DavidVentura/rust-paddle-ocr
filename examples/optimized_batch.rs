@@ -31,8 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("1️⃣  默认配置 - 序列批量推理");
     let config_default = OcrEngineConfig::fast();
 
-    let engine_default =
-        OcrEngine::new(det_model, rec_model, charset, Some(config_default))?;
+    let engine_default = OcrEngine::new(det_model, rec_model, charset, Some(config_default))?;
     let image = image::open(test_image)?;
 
     let start = Instant::now();
@@ -47,8 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("2️⃣  启用并行处理 - Rayon 并行识别");
     let config_parallel = OcrEngineConfig::fast().with_parallel(true);
 
-    let engine_parallel =
-        OcrEngine::new(det_model, rec_model, charset, Some(config_parallel))?;
+    let engine_parallel = OcrEngine::new(det_model, rec_model, charset, Some(config_parallel))?;
 
     let start = Instant::now();
     let results_parallel = engine_parallel.recognize(&image)?;

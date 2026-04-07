@@ -120,8 +120,7 @@ fn test_ocr_engine_with_config() {
         .with_det_options(DetOptions::fast())
         .with_rec_options(RecOptions::new().with_min_score(0.3));
 
-    let engine =
-        OcrEngine::new(DET_MODEL_PATH, REC_MODEL_PATH, CHARSET_PATH, Some(config));
+    let engine = OcrEngine::new(DET_MODEL_PATH, REC_MODEL_PATH, CHARSET_PATH, Some(config));
     assert!(engine.is_ok(), "配置 OCR 引擎失败: {:?}", engine.err());
 }
 
@@ -159,6 +158,30 @@ fn test_detection_on_image() {
     let boxes = boxes.unwrap();
     // 测试图像应该有文本
     assert!(!boxes.is_empty(), "测试图像应该检测到文本");
+}
+
+#[test]
+fn test_detection_components_on_image() {
+    if !models_exist() || !test_image_exists() {
+        eprintln!("跳过测试：模型或测试图像不存在");
+        return;
+    }
+
+    let det = DetModel::from_file(DET_MODEL_PATH, None)
+        .unwrap()
+        .with_options(
+            DetOptions::new()
+                .with_unclip_ratio(0.7)
+                .with_score_threshold(0.35)
+                .with_min_area(8),
+        );
+    let image = image::open(TEST_IMAGE_PATH).unwrap();
+
+    let boxes = det.detect_components(&image);
+    assert!(boxes.is_ok(), "组件检测失败: {:?}", boxes.err());
+
+    let boxes = boxes.unwrap();
+    assert!(!boxes.is_empty(), "测试图像应该检测到组件文本框");
 }
 
 #[test]

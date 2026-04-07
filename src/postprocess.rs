@@ -129,6 +129,33 @@ pub fn extract_boxes_from_mask_with_padding(
     )
 }
 
+/// Extract connected-component boxes from a binarized segmentation mask without DB unclip.
+///
+/// This is useful for experiments that want tighter pre-unclip regions, which can
+/// sometimes approximate word-level boxes better than the default line-oriented DB output.
+pub fn extract_boxes_from_mask_without_unclip(
+    mask: &[u8],
+    mask_width: u32,
+    mask_height: u32,
+    valid_width: u32,
+    valid_height: u32,
+    original_width: u32,
+    original_height: u32,
+    min_area: u32,
+) -> Vec<TextBox> {
+    extract_boxes_from_mask_with_optional_unclip(
+        mask,
+        mask_width,
+        mask_height,
+        valid_width,
+        valid_height,
+        original_width,
+        original_height,
+        min_area,
+        None,
+    )
+}
+
 /// Extract text bounding boxes from segmentation mask (with unclip expansion)
 ///
 /// Core of DB algorithm is to perform unclip expansion on detected contours,
@@ -143,6 +170,30 @@ pub fn extract_boxes_with_unclip(
     original_height: u32,
     min_area: u32,
     unclip_ratio: f32,
+) -> Vec<TextBox> {
+    extract_boxes_from_mask_with_optional_unclip(
+        mask,
+        mask_width,
+        mask_height,
+        valid_width,
+        valid_height,
+        original_width,
+        original_height,
+        min_area,
+        Some(unclip_ratio),
+    )
+}
+
+fn extract_boxes_from_mask_with_optional_unclip(
+    mask: &[u8],
+    mask_width: u32,
+    mask_height: u32,
+    valid_width: u32,
+    valid_height: u32,
+    original_width: u32,
+    original_height: u32,
+    min_area: u32,
+    unclip_ratio: Option<f32>,
 ) -> Vec<TextBox> {
     // Create grayscale image
     let gray_image = GrayImage::from_raw(mask_width, mask_height, mask.to_vec())
@@ -190,17 +241,23 @@ pub fn extract_boxes_with_unclip(
             continue;
         }
 
-        // Calculate unclip expansion amount
-        // DB algorithm uses area and perimeter to calculate expansion distance: distance = Area * unclip_ratio / Perimeter
-        let area = box_width as f32 * box_height as f32;
-        let perimeter = 2.0 * (box_width + box_height) as f32;
-        let expand_dist = (area * unclip_ratio / perimeter).max(1.0);
+        let (expanded_min_x, expanded_min_y, expanded_max_x, expanded_max_y) =
+            if let Some(unclip_ratio) = unclip_ratio {
+                // DB algorithm uses area and perimeter to calculate expansion distance:
+                // distance = Area * unclip_ratio / Perimeter
+                let area = box_width as f32 * box_height as f32;
+                let perimeter = 2.0 * (box_width + box_height) as f32;
+                let expand_dist = (area * unclip_ratio / perimeter).max(1.0);
 
-        // Apply unclip expansion (on coordinates before scaling)
-        let expanded_min_x = (min_x as f32 - expand_dist).max(0.0) as i32;
-        let expanded_min_y = (min_y as f32 - expand_dist).max(0.0) as i32;
-        let expanded_max_x = (max_x as f32 + expand_dist).min(valid_width as f32) as i32;
-        let expanded_max_y = (max_y as f32 + expand_dist).min(valid_height as f32) as i32;
+                (
+                    (min_x as f32 - expand_dist).max(0.0) as i32,
+                    (min_y as f32 - expand_dist).max(0.0) as i32,
+                    (max_x as f32 + expand_dist).min(valid_width as f32) as i32,
+                    (max_y as f32 + expand_dist).min(valid_height as f32) as i32,
+                )
+            } else {
+                (min_x, min_y, max_x, max_y)
+            };
 
         let expanded_w = (expanded_max_x - expanded_min_x) as u32;
         let expanded_h = (expanded_max_y - expanded_min_y) as u32;
@@ -878,5 +935,35 @@ mod tests {
 
         // 应该分成两行
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_boxes_without_unclip_is_tighter_than_unclip() {
+        let width = 10;
+        let height = 10;
+        let mut mask = vec![0u8; (width * height) as usize];
+
+        for y in 2..6 {
+            for x in 3..7 {
+                mask[(y * width + x) as usize] = 255;
+            }
+        }
+
+        let raw_boxes = extract_boxes_from_mask_without_unclip(
+            &mask, width, height, width, height, width, height, 1,
+        );
+        let unclipped_boxes =
+            extract_boxes_with_unclip(&mask, width, height, width, height, width, height, 1, 1.5);
+
+        assert_eq!(raw_boxes.len(), 1);
+        assert_eq!(unclipped_boxes.len(), 1);
+
+        let raw = &raw_boxes[0].rect;
+        let expanded = &unclipped_boxes[0].rect;
+
+        assert!(expanded.width() >= raw.width());
+        assert!(expanded.height() >= raw.height());
+        assert!(expanded.left() <= raw.left());
+        assert!(expanded.top() <= raw.top());
     }
 }

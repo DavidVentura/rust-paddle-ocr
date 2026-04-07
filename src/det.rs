@@ -8,14 +8,26 @@ use std::path::Path;
 
 use crate::error::{OcrError, OcrResult};
 use crate::mnn::{InferenceConfig, InferenceEngine};
-use crate::postprocess::{extract_boxes_with_unclip, TextBox};
-use crate::preprocess::{preprocess_for_det, NormalizeParams};
+use crate::postprocess::{
+    extract_boxes_from_mask_without_unclip, extract_boxes_with_unclip, TextBox,
+};
+use crate::preprocess::{preprocess_for_det, resize_to_max_side, NormalizeParams};
 
 /// Detection precision mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DetPrecisionMode {
     /// Fast mode - single detection
     #[default]
+    Fast,
+}
+
+/// Detection resize mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DetResizeMode {
+    /// Use the `image` crate Lanczos3 resize path.
+    #[default]
+    Lanczos3,
+    /// Use the `fast_image_resize` helper from the preprocess module.
     Fast,
 }
 
@@ -40,6 +52,8 @@ pub struct DetOptions {
     pub merge_threshold: i32,
     /// Precision mode
     pub precision_mode: DetPrecisionMode,
+    /// Resize mode used before preprocessing
+    pub resize_mode: DetResizeMode,
     /// Scale ratios for multi-scale detection (high precision mode only)
     pub multi_scales: Vec<f32>,
     /// Block size for block detection (high precision mode only)
@@ -62,6 +76,7 @@ impl Default for DetOptions {
             merge_boxes: false,
             merge_threshold: 10,
             precision_mode: DetPrecisionMode::Fast,
+            resize_mode: DetResizeMode::Lanczos3,
             multi_scales: vec![0.5, 1.0, 1.5],
             block_size: 640,
             block_overlap: 100,
@@ -94,6 +109,16 @@ impl DetOptions {
         self
     }
 
+    /// Set text box expansion ratio used by DB postprocess.
+    ///
+    /// Lower values produce tighter boxes. This can help when experimenting with
+    /// word-level boxes, but it will not split a single connected mask into
+    /// separate words on its own.
+    pub fn with_unclip_ratio(mut self, ratio: f32) -> Self {
+        self.unclip_ratio = ratio;
+        self
+    }
+
     /// Set minimum area
     pub fn with_min_area(mut self, area: u32) -> Self {
         self.min_area = area;
@@ -121,6 +146,12 @@ impl DetOptions {
     /// Set precision mode
     pub fn with_precision_mode(mut self, mode: DetPrecisionMode) -> Self {
         self.precision_mode = mode;
+        self
+    }
+
+    /// Set resize mode used before preprocessing.
+    pub fn with_resize_mode(mut self, mode: DetResizeMode) -> Self {
+        self.resize_mode = mode;
         self
     }
 
@@ -208,6 +239,15 @@ impl DetModel {
         self.detect_fast(image)
     }
 
+    /// Detect connected-component boxes directly from the thresholded DB mask,
+    /// skipping DB unclip expansion.
+    ///
+    /// This returns tighter pre-unclip regions and is intended for experiments
+    /// where the default line-oriented DB boxes are too coarse.
+    pub fn detect_components(&self, image: &DynamicImage) -> OcrResult<Vec<TextBox>> {
+        self.detect_with_postprocess(image, PostprocessMode::ConnectedComponents)
+    }
+
     /// Detect and return cropped text images
     ///
     /// # Parameters
@@ -241,10 +281,18 @@ impl DetModel {
 
     /// Fast detection (single inference)
     fn detect_fast(&self, image: &DynamicImage) -> OcrResult<Vec<TextBox>> {
+        self.detect_with_postprocess(image, PostprocessMode::DbUnclip)
+    }
+
+    fn detect_with_postprocess(
+        &self,
+        image: &DynamicImage,
+        postprocess_mode: PostprocessMode,
+    ) -> OcrResult<Vec<TextBox>> {
         let (original_width, original_height) = image.dimensions();
 
         // Scale image
-        let scaled = self.scale_image(image);
+        let scaled = self.scale_image(image)?;
         let (scaled_width, scaled_height) = scaled.dimensions();
 
         // Preprocess
@@ -266,6 +314,7 @@ impl DetModel {
             scaled_height,
             original_width,
             original_height,
+            postprocess_mode,
         )?;
 
         Ok(boxes)
@@ -273,19 +322,23 @@ impl DetModel {
 
     /// Balanced mode detection (multi-scale)
     /// Scale image to maximum side length limit
-    fn scale_image(&self, image: &DynamicImage) -> DynamicImage {
+    fn scale_image(&self, image: &DynamicImage) -> OcrResult<DynamicImage> {
         let (w, h) = image.dimensions();
         let max_dim = w.max(h);
 
         if max_dim <= self.options.max_side_len {
-            return image.clone();
+            return Ok(image.clone());
         }
 
-        let scale = self.options.max_side_len as f64 / max_dim as f64;
-        let new_w = (w as f64 * scale).round() as u32;
-        let new_h = (h as f64 * scale).round() as u32;
-
-        image.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3)
+        match self.options.resize_mode {
+            DetResizeMode::Lanczos3 => {
+                let scale = self.options.max_side_len as f64 / max_dim as f64;
+                let new_w = (w as f64 * scale).round() as u32;
+                let new_h = (h as f64 * scale).round() as u32;
+                Ok(image.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3))
+            }
+            DetResizeMode::Fast => resize_to_max_side(image, self.options.max_side_len),
+        }
     }
 
     /// Post-process inference output
@@ -298,6 +351,7 @@ impl DetModel {
         scaled_height: u32,
         original_width: u32,
         original_height: u32,
+        postprocess_mode: PostprocessMode,
     ) -> OcrResult<Vec<TextBox>> {
         // Retrieve output data
         let output_shape = output.shape();
@@ -322,22 +376,42 @@ impl DetModel {
             })
             .collect();
 
-        // Extract bounding boxes (with unclip expansion)
-        // DB algorithm needs to expand detected contours because model output segmentation mask is usually smaller than actual text region
-        let boxes = extract_boxes_with_unclip(
-            &binary_mask,
-            out_w,
-            out_h,
-            scaled_width,
-            scaled_height,
-            original_width,
-            original_height,
-            self.options.min_area,
-            self.options.unclip_ratio,
-        );
+        let boxes = match postprocess_mode {
+            PostprocessMode::DbUnclip => {
+                // DB algorithm needs to expand detected contours because model output
+                // segmentation mask is usually smaller than actual text region.
+                extract_boxes_with_unclip(
+                    &binary_mask,
+                    out_w,
+                    out_h,
+                    scaled_width,
+                    scaled_height,
+                    original_width,
+                    original_height,
+                    self.options.min_area,
+                    self.options.unclip_ratio,
+                )
+            }
+            PostprocessMode::ConnectedComponents => extract_boxes_from_mask_without_unclip(
+                &binary_mask,
+                out_w,
+                out_h,
+                scaled_width,
+                scaled_height,
+                original_width,
+                original_height,
+                self.options.min_area,
+            ),
+        };
 
         Ok(boxes)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostprocessMode {
+    DbUnclip,
+    ConnectedComponents,
 }
 
 /// Low-level detection API
@@ -382,6 +456,7 @@ mod tests {
         assert!(!opts.merge_boxes);
         assert_eq!(opts.merge_threshold, 10);
         assert_eq!(opts.precision_mode, DetPrecisionMode::Fast);
+        assert_eq!(opts.resize_mode, DetResizeMode::Lanczos3);
         assert_eq!(opts.nms_threshold, 0.3);
     }
 
@@ -397,23 +472,27 @@ mod tests {
         let opts = DetOptions::new()
             .with_max_side_len(1280)
             .with_box_threshold(0.6)
+            .with_unclip_ratio(0.8)
             .with_score_threshold(0.4)
             .with_min_area(32)
             .with_box_border(10)
             .with_merge_boxes(true)
             .with_merge_threshold(20)
             .with_precision_mode(DetPrecisionMode::Fast)
+            .with_resize_mode(DetResizeMode::Fast)
             .with_multi_scales(vec![0.5, 1.0, 1.5])
             .with_block_size(800);
 
         assert_eq!(opts.max_side_len, 1280);
         assert_eq!(opts.box_threshold, 0.6);
+        assert_eq!(opts.unclip_ratio, 0.8);
         assert_eq!(opts.score_threshold, 0.4);
         assert_eq!(opts.min_area, 32);
         assert_eq!(opts.box_border, 10);
         assert!(opts.merge_boxes);
         assert_eq!(opts.merge_threshold, 20);
         assert_eq!(opts.precision_mode, DetPrecisionMode::Fast);
+        assert_eq!(opts.resize_mode, DetResizeMode::Fast);
         assert_eq!(opts.multi_scales, vec![0.5, 1.0, 1.5]);
         assert_eq!(opts.block_size, 800);
     }
@@ -439,6 +518,7 @@ mod tests {
         assert_eq!(opts.max_side_len, 1000);
         assert_eq!(opts.box_threshold, 0.7);
         // Other values should be default values
+        assert_eq!(opts.unclip_ratio, 1.5);
         assert_eq!(opts.score_threshold, 0.3);
     }
 
@@ -449,5 +529,11 @@ mod tests {
         assert!(fast.box_threshold >= 0.0 && fast.box_threshold <= 1.0);
         assert!(fast.score_threshold >= 0.0 && fast.score_threshold <= 1.0);
         assert!(fast.nms_threshold >= 0.0 && fast.nms_threshold <= 1.0);
+    }
+
+    #[test]
+    fn test_det_resize_mode_default() {
+        let mode = DetResizeMode::default();
+        assert_eq!(mode, DetResizeMode::Lanczos3);
     }
 }
