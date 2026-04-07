@@ -98,6 +98,10 @@ fn main() {
         MnnLinkMode::BuildFromSource => {
             // Get or download MNN source code
             let mnn_source_dir = get_mnn_source(&manifest_dir_path);
+            println!(
+                "cargo:rerun-if-changed={}",
+                mnn_source_dir.join("CMakeLists.txt").display()
+            );
 
             // Build MNN using cmake
             let dst = build_mnn_with_cmake(
@@ -681,9 +685,6 @@ fn build_mnn_with_cmake(
     if vulkan_enabled {
         config.define("MNN_VULKAN", "ON");
     }
-
-    println!("cargo:rerun-if-changed=MNN/CMakeLists.txt");
-
     config.build()
 }
 
