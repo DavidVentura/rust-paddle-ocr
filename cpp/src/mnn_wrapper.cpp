@@ -26,10 +26,11 @@ std::unique_ptr<T> make_unique_ptr(Args &&...args)
     return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
 }
 
-// Global mutex to serialize MNN inference calls
-// MNN's internal thread pool has a limit of MNN_THREAD_POOL_MAX_TASKS (default=2)
-// This mutex ensures only one inference runs at a time, avoiding thread pool exhaustion
-static std::mutex g_mnn_inference_mutex;
+// Global mutex DISABLED to allow per-engine concurrent inference.
+// Original wrapper serialized everything via this mutex citing MNN_THREAD_POOL_MAX_TASKS=2.
+// Per-engine mutex (engine->mutex / pool->mutex / session->engine->mutex) still protects
+// session-internal state. Separate engines run truly concurrently.
+// static std::mutex g_mnn_inference_mutex;
 
 // ============== Internal Structures ==============
 
@@ -359,8 +360,6 @@ MNNR_ErrorCode mnnr_run_inference(
         return MNNR_ERROR_INVALID_PARAMETER;
     }
 
-    // Use global lock to serialize MNN inference (thread pool limit)
-    std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
     std::lock_guard<std::mutex> lock(engine->mutex);
 
     // Calculate expected sizes
@@ -515,9 +514,6 @@ MNNR_ErrorCode mnnr_session_pool_run(
     std::memcpy(input_host->host<float>(), input_data, input_size * sizeof(float));
 
     {
-        // Global lock for MNN inference to avoid thread pool exhaustion
-        std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
-
         input_tensor->copyFromHostTensor(input_host.get());
 
         // Run inference
@@ -634,9 +630,6 @@ MNNR_ErrorCode mnnr_run_inference_with_session(
     std::memcpy(input_host->host<float>(), input_data, input_size * sizeof(float));
 
     {
-        // Global lock for MNN inference to avoid thread pool exhaustion
-        std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
-
         session->input_tensor->copyFromHostTensor(input_host.get());
 
         // Run inference
@@ -682,7 +675,6 @@ MNNR_ErrorCode mnnr_run_inference_dynamic(
         return MNNR_ERROR_INVALID_PARAMETER;
     }
 
-    std::lock_guard<std::mutex> global_lock(g_mnn_inference_mutex);
     std::lock_guard<std::mutex> lock(engine->mutex);
 
     // Build new input shape
