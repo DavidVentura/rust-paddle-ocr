@@ -16,6 +16,9 @@ pub struct TextBox {
     pub score: f32,
     /// Four corner points (optional, for rotated boxes)
     pub points: Option<[Point<f32>; 4]>,
+    /// Full DBNet contour in original-image coords (optional). Carries shape info that the
+    /// 4-corner reduction throws away — e.g. arched/curved text lines on cylindrical labels.
+    pub contour: Option<Vec<Point<f32>>>,
 }
 
 impl TextBox {
@@ -25,6 +28,7 @@ impl TextBox {
             rect,
             score,
             points: None,
+            contour: None,
         }
     }
 
@@ -34,6 +38,22 @@ impl TextBox {
             rect,
             score,
             points: Some(points),
+            contour: None,
+        }
+    }
+
+    /// Create with corner points and full contour
+    pub fn with_points_and_contour(
+        rect: Rect,
+        score: f32,
+        points: [Point<f32>; 4],
+        contour: Vec<Point<f32>>,
+    ) -> Self {
+        Self {
+            rect,
+            score,
+            points: Some(points),
+            contour: Some(contour),
         }
     }
 
@@ -57,6 +77,7 @@ impl TextBox {
             rect: Rect::at(x as i32, y as i32).of_size(width, height),
             score: self.score,
             points: self.points,
+            contour: self.contour.clone(),
         }
     }
 }
@@ -276,11 +297,127 @@ fn extract_boxes_from_mask_with_optional_unclip(
 
         if final_w > 0 && final_h > 0 {
             let rect = Rect::at(final_x as i32, final_y as i32).of_size(final_w, final_h);
-            boxes.push(TextBox::new(rect, 1.0));
+            // Compute oriented bounding box from the contour points (via PCA → principal
+            // axis), scaled to original-image coords. Captures the text-region rotation that
+            // the AABB throws away.
+            let oriented = compute_oriented_rect_from_contour(
+                &contour.points,
+                scale_x,
+                scale_y,
+            );
+            // Also keep the raw contour in original-image coords. Lets downstream code see
+            // arched/curved text shapes that the 4-corner reduction throws away.
+            let scaled_contour: Vec<Point<f32>> = contour
+                .points
+                .iter()
+                .map(|p| Point::new(p.x as f32 * scale_x, p.y as f32 * scale_y))
+                .collect();
+            boxes.push(match oriented {
+                Some(points) => TextBox::with_points_and_contour(rect, 1.0, points, scaled_contour),
+                None => TextBox::new(rect, 1.0),
+            });
         }
     }
 
     boxes
+}
+
+/// Compute the oriented bounding rectangle of [contour_points] (in mask coordinates) and
+/// return its 4 corners in original-image coords (scaled by [scale_x], [scale_y]).
+///
+/// Uses PCA on the contour points: the principal eigenvector of the 2D covariance matrix is
+/// the long axis of the text region. The 4 corners are obtained by projecting all contour
+/// points onto the principal axis (u) and the perpendicular (v), taking the min/max of each,
+/// and transforming back to image coords.
+///
+/// Returns corners ordered as a clockwise traversal starting from the top-left in the
+/// oriented frame (uMin, vMin), (uMax, vMin), (uMax, vMax), (uMin, vMax).
+fn compute_oriented_rect_from_contour(
+    contour_points: &[Point<i32>],
+    scale_x: f32,
+    scale_y: f32,
+) -> Option<[Point<f32>; 4]> {
+    if contour_points.len() < 4 {
+        return None;
+    }
+    let n = contour_points.len() as f32;
+    let mut mean_x = 0.0f32;
+    let mut mean_y = 0.0f32;
+    for p in contour_points {
+        mean_x += p.x as f32;
+        mean_y += p.y as f32;
+    }
+    mean_x /= n;
+    mean_y /= n;
+
+    let mut cxx = 0.0f32;
+    let mut cyy = 0.0f32;
+    let mut cxy = 0.0f32;
+    for p in contour_points {
+        let dx = p.x as f32 - mean_x;
+        let dy = p.y as f32 - mean_y;
+        cxx += dx * dx;
+        cyy += dy * dy;
+        cxy += dx * dy;
+    }
+    cxx /= n;
+    cyy /= n;
+    cxy /= n;
+
+    // 2x2 symmetric eigendecomposition. Larger eigenvalue's eigenvector = principal axis.
+    let trace = cxx + cyy;
+    let det = cxx * cyy - cxy * cxy;
+    let disc = (trace * trace - 4.0 * det).max(0.0).sqrt();
+    let lambda1 = (trace + disc) * 0.5;
+
+    let (ex, ey) = if cxy.abs() > 1e-6 {
+        (lambda1 - cyy, cxy)
+    } else if cxx >= cyy {
+        (1.0, 0.0)
+    } else {
+        (0.0, 1.0)
+    };
+    let norm = (ex * ex + ey * ey).sqrt().max(1e-6);
+    let ux = ex / norm;
+    let uy = ey / norm;
+    // Perpendicular axis (rotated +90° from u).
+    let vx = -uy;
+    let vy = ux;
+
+    let mut u_min = f32::INFINITY;
+    let mut u_max = f32::NEG_INFINITY;
+    let mut v_min = f32::INFINITY;
+    let mut v_max = f32::NEG_INFINITY;
+    for p in contour_points {
+        let dx = p.x as f32 - mean_x;
+        let dy = p.y as f32 - mean_y;
+        let u = dx * ux + dy * uy;
+        let v = dx * vx + dy * vy;
+        if u < u_min { u_min = u; }
+        if u > u_max { u_max = u; }
+        if v < v_min { v_min = v; }
+        if v > v_max { v_max = v; }
+    }
+
+    let back = |u: f32, v: f32| -> Point<f32> {
+        Point::new(
+            (mean_x + u * ux + v * vx) * scale_x,
+            (mean_y + u * uy + v * vy) * scale_y,
+        )
+    };
+    // Ensure the principal axis points right-ish in image space so the ordering is intuitive
+    // (TL, TR, BR, BL).
+    let (u_lo, u_hi, v_lo, v_hi) = if ux >= 0.0 {
+        (u_min, u_max, v_min, v_max)
+    } else {
+        (u_max, u_min, v_max, v_min)
+    };
+    Some([
+        back(u_lo, v_lo),
+        back(u_hi, v_lo),
+        back(u_hi, v_hi),
+        back(u_lo, v_hi),
+    ])
 }
 
 /// Get contour bounds
